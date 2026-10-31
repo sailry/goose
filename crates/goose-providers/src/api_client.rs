@@ -31,6 +31,7 @@ pub struct ApiClient {
     timeout: Duration,
     tls_config: Option<TlsConfig>,
     request_builder: Option<RequestBuilderDecorator>,
+    request_finalizer: Option<RequestBuilderDecorator>,
     transport_policy: TransportPolicy,
 }
 
@@ -293,6 +294,7 @@ impl ApiClient {
             timeout,
             tls_config,
             request_builder: None,
+            request_finalizer: None,
             transport_policy: TransportPolicy::Default,
         })
     }
@@ -452,6 +454,14 @@ impl ApiClient {
         self
     }
 
+    /// Transform the complete request after authentication and body serialization,
+    /// immediately before sending. Runs for each request attempt, including retries.
+    /// The existing builder decorator still runs before authentication and bodies.
+    pub fn with_request_finalizer(mut self, finalizer: RequestBuilderDecorator) -> Self {
+        self.request_finalizer = Some(finalizer);
+        self
+    }
+
     // Auth is applied fresh on every request, so unlike `with_headers` this
     // doesn't need to rebuild the underlying `reqwest::Client`.
     pub fn with_auth(mut self, auth: AuthMethod) -> Self {
@@ -569,7 +579,15 @@ impl<'a> ApiRequestBuilder<'a> {
         ApiResponse::from_response(response).await
     }
 
+    fn finalize(&self, request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+        match &self.client.request_finalizer {
+            Some(finalizer) => finalizer(request),
+            None => Ok(request),
+        }
+    }
+
     async fn send_bounded(&self, request: reqwest::RequestBuilder) -> Result<Response> {
+        let request = self.finalize(request)?;
         if self.streaming {
             Ok(crate::http_status::send_bounded(request, self.client.timeout).await?)
         } else {
@@ -584,7 +602,7 @@ impl<'a> ApiRequestBuilder<'a> {
 
     pub async fn multipart_post(self, form: reqwest::multipart::Form) -> Result<Response> {
         let request = self.send_request(|url, client| client.post(url)).await?;
-        Ok(request.multipart(form).send().await?)
+        Ok(self.finalize(request.multipart(form))?.send().await?)
     }
 
     pub async fn api_get(self) -> Result<ApiResponse> {
@@ -1077,6 +1095,68 @@ mod tests {
             .request("/test")
             .model_headers(&model_config)
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn finalizes_serialized_authenticated_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(count, 0);
+                received.extend_from_slice(&buffer[..count]);
+                if let Some(end) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&received[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if received.len() >= end + 4 + length {
+                        assert_eq!(&received[end + 4..], br#"{"changed":true}"#);
+                        break;
+                    }
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+            String::from_utf8(received).unwrap()
+        });
+        let client = ApiClient::new_with_tls(
+            format!("http://{address}"),
+            AuthMethod::BearerToken("test-token".into()),
+            None,
+        )
+        .unwrap()
+        .with_request_finalizer(Arc::new(|builder| {
+            let (client, request) = builder.build_split();
+            let mut request = request?;
+            assert_eq!(request.headers()["authorization"], "Bearer test-token");
+            let original: Value =
+                serde_json::from_slice(request.body().unwrap().as_bytes().unwrap())?;
+            assert_eq!(original, serde_json::json!({"original":true}));
+            *request.body_mut() = Some(br#"{"changed":true}"#.to_vec().into());
+            Ok(reqwest::RequestBuilder::from_parts(client, request).header("x-finalized", "yes"))
+        }));
+        let response = client
+            .request("/test")
+            .streaming(true)
+            .response_post(&serde_json::json!({"original":true}))
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let received = server.await.unwrap().to_ascii_lowercase();
+        assert!(received.contains("authorization: bearer test-token"));
+        assert!(received.contains("x-finalized: yes"));
     }
 
     #[test]
