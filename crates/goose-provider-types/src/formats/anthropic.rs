@@ -10,7 +10,7 @@ use crate::errors::ProviderError;
 use crate::images::{convert_image, ImageFormat};
 use crate::maybe_send::MaybeSend;
 use crate::mcp_utils::extract_text_from_resource;
-use crate::model::ModelConfig;
+use crate::model::{ModelConfig, is_goose_internal_request_param};
 use crate::thinking::ThinkingEffort;
 use anyhow::{anyhow, Result};
 use rmcp::model::{
@@ -998,6 +998,18 @@ pub fn create_request_for_model(
         options,
     );
 
+    if let Some(params) = &model_config.request_params {
+        let object = payload.as_object_mut().unwrap();
+        for (key, value) in params {
+            if !is_goose_internal_request_param(key)
+                && !is_reserved_request_param_key(key)
+                && !matches!(key.as_str(), "budget_tokens" | "prefix_mismatch_behavior")
+            {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
     Ok(payload)
 }
 
@@ -1806,6 +1818,46 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, Some(5000));
         assert_eq!(usage.cache_write_input_tokens, Some(10000));
 
+        Ok(())
+    }
+
+    #[test]
+    fn request_params_preserve_managed_fields() -> Result<()> {
+        let params = std::collections::HashMap::from([
+            ("metadata".into(), json!({"user_id":"fixture"})),
+            ("model".into(), json!("replaced")),
+            ("messages".into(), json!([])),
+            ("system".into(), json!("replaced")),
+            ("tools".into(), json!([{"name":"replaced"}])),
+            ("stream".into(), json!(false)),
+            ("max_tokens".into(), json!(1)),
+            ("thinking_effort".into(), json!("off")),
+            ("budget_tokens".into(), json!(4096)),
+            ("prefix_mismatch_behavior".into(), json!("off")),
+            ("cache_ttl".into(), json!("1h")),
+        ]);
+        let config = cfg("claude-sonnet-4-5").with_merged_request_params(params);
+        let payload = create_request_with_default_options(
+            &config,
+            "system",
+            &[Message::user().with_text("Hello")],
+            &[],
+        )?;
+        assert_eq!(payload["metadata"]["user_id"], "fixture");
+        assert_eq!(payload["model"], "claude-sonnet-4-5");
+        assert_eq!(payload["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["system"][0]["text"], "system");
+        assert_eq!(payload["max_tokens"], config.max_output_tokens());
+        for key in [
+            "tools",
+            "stream",
+            "thinking_effort",
+            "budget_tokens",
+            "prefix_mismatch_behavior",
+            "cache_ttl",
+        ] {
+            assert!(payload.get(key).is_none(), "unexpected field: {key}");
+        }
         Ok(())
     }
 

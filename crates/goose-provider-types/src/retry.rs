@@ -87,14 +87,13 @@ impl RetryConfig {
     }
 }
 
-/// Substrings marking a `RequestFailed` (4xx) as deterministically permanent:
-/// Anthropic rejects signed `thinking`/`redacted_thinking` blocks as immutable
-/// once a thinking model's config changes mid-conversation, and the identical
-/// payload is rebuilt on every retry — so retrying can never succeed.
+/// Deterministic 4xx failures that require changing the request rather than
+/// resending the same payload. Callers may handle a supported repair separately.
 const PERMANENT_REQUEST_FAILURE_MARKERS: &[&str] = &[
     "blocks in the latest assistant message cannot be modified",
     "must remain as they were in the original response",
     "Reasoning is mandatory for this endpoint",
+    "claude_code_version_too_old",
 ];
 
 fn is_permanent_request_failure(message: &str) -> bool {
@@ -292,6 +291,18 @@ mod tests {
                 .into(),
         );
         assert!(!should_retry(&error, &config));
+    }
+
+    #[test]
+    fn never_retries_rejected_cli_version() {
+        let error = ProviderError::RequestFailed(
+            "claude_code_version_too_old: version 2.1.990 or newer is required".into(),
+        );
+        assert!(!should_retry(&error, &RetryConfig::default()));
+        assert!(!should_retry(
+            &error,
+            &RetryConfig::default().transient_only()
+        ));
     }
 
     #[test]
