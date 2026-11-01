@@ -33,6 +33,9 @@ unicode-normalization = { version = "0.1.22", default-features = false, features
 uuid = { workspace = true, features = ["v4", "std"] }
 zstd = "0.14.3"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["rt"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
 uuid = { workspace = true, features = ["js"] }
@@ -43,7 +46,7 @@ gloo-timers = { version = "0.3.0", features = ["futures"] }
 env-lock = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-stream = { workspace = true }
 
 [build-dependencies]

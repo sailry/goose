@@ -13,8 +13,26 @@ use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::{Response, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio_util::codec::LinesCodecError;
 
 pub const MAX_PROVIDER_JSON_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+pub(crate) fn stream_line_error(error: LinesCodecError) -> anyhow::Error {
+    if let LinesCodecError::Io(source) = &error {
+        if let Some(transport) = source
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<reqwest::Error>())
+        {
+            let details = if transport.is_timeout() {
+                "Provider response stream timed out"
+            } else {
+                "Connection interrupted while reading the provider response"
+            };
+            return ProviderError::NetworkError(details.to_string()).into();
+        }
+    }
+    ProviderError::stream_decode_error(error).into()
+}
 
 /// Strip credentials and sensitive query parameters from a URL for safe
 /// inclusion in error messages and logs. Drops userinfo (`user:pass@`) and
@@ -507,6 +525,24 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn codec_failures_remain_terminal_decode_errors() {
+        for error in [
+            LinesCodecError::MaxLineLengthExceeded,
+            LinesCodecError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid UTF-8",
+            )),
+        ] {
+            let error = stream_line_error(error)
+                .downcast::<ProviderError>()
+                .unwrap();
+            assert!(
+                matches!(error, ProviderError::NetworkError(details) if details.starts_with("Stream decode error:"))
+            );
+        }
+    }
 
     fn empty_headers() -> HeaderMap {
         HeaderMap::new()

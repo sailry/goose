@@ -16,6 +16,119 @@ pub const DEFAULT_INITIAL_RETRY_INTERVAL_MS: u64 = 1000;
 pub const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
 pub const DEFAULT_MAX_RETRY_INTERVAL_MS: u64 = 30_000;
 
+#[cfg(not(target_arch = "wasm32"))]
+tokio::task_local! {
+    static SINGLE_ATTEMPT: ();
+}
+
+fn single_attempt() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        SINGLE_ATTEMPT.try_with(|_| ()).is_ok()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+}
+
+/// An opt-in fixed retry budget shared by request setup and stream failures.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy)]
+pub struct StreamRetry {
+    max_retries: usize,
+    interval: Duration,
+    buffered: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl StreamRetry {
+    /// Retry at most `max_retries` times after the initial request, without jitter.
+    pub fn fixed(max_retries: usize, interval: Duration) -> Self {
+        Self {
+            max_retries,
+            interval,
+            buffered: false,
+        }
+    }
+
+    /// Withhold each attempt's output until it completes successfully.
+    /// Failed compaction summaries and their usage are discarded together.
+    pub fn buffered(mut self) -> Self {
+        self.buffered = true;
+        self
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn retryable_stream_error(error: &ProviderError) -> bool {
+    if matches!(error, ProviderError::NetworkError(details) if details.starts_with("Stream decode error:"))
+    {
+        return false;
+    }
+    should_retry(error, &RetryConfig::default().transient_only())
+}
+
+/// Retry a provider request before output escapes, or buffer an entire attempt.
+/// Dropping the stream cancels its active request or fixed retry delay.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn stream_with_retry(
+    provider: std::sync::Arc<dyn Provider>,
+    model: crate::model::ModelConfig,
+    system: String,
+    messages: Vec<crate::conversation::message::Message>,
+    tools: Vec<rmcp::model::Tool>,
+    policy: StreamRetry,
+) -> crate::base::MessageStream {
+    use futures::StreamExt;
+
+    Box::pin(async_stream::stream! {
+        let mut retries = 0;
+        loop {
+            let mut visible = false;
+            let mut buffered = Vec::new();
+            let failure = match SINGLE_ATTEMPT.scope((), provider.stream(&model, &system, &messages, &tools)).await {
+                Err(error) => Some(error),
+                Ok(mut stream) => loop {
+                    // Providers may defer HTTP work until the first or a later poll.
+                    match SINGLE_ATTEMPT.scope((), stream.next()).await {
+                        Some(Ok(chunk)) if policy.buffered => buffered.push(chunk),
+                        Some(Ok(chunk)) => {
+                            visible |= chunk.0.is_some() || chunk.1.is_some();
+                            yield Ok(chunk);
+                        }
+                        Some(Err(error)) => break Some(error),
+                        None => break None,
+                    }
+                },
+            };
+
+            let Some(error) = failure else {
+                for chunk in buffered {
+                    yield Ok(chunk);
+                }
+                break;
+            };
+            if visible || !retryable_stream_error(&error) || retries == policy.max_retries {
+                yield Err(error);
+                break;
+            }
+            retries += 1;
+            tracing::warn!(
+                retry = retries,
+                max_retries = policy.max_retries,
+                error_type = error.telemetry_type(),
+                "Retrying provider stream after transient failure"
+            );
+            let skip_backoff = std::env::var("GOOSE_PROVIDER_SKIP_BACKOFF")
+                .is_ok_and(|value| value.parse::<bool>().unwrap_or(false));
+            if !skip_backoff {
+                sleep(policy.interval).await;
+            }
+        }
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts
@@ -124,6 +237,9 @@ where
     Fut: Future<Output = Result<T, ProviderError>> + MaybeSend,
     T: MaybeSend,
 {
+    if single_attempt() {
+        return operation().await;
+    }
     let mut attempts = 0;
 
     loop {
@@ -231,7 +347,10 @@ impl<P: Provider> ProviderRetry for P {
                         }
                     }
 
-                    if should_retry(&error, &config) && attempts < config.max_retries {
+                    if !single_attempt()
+                        && should_retry(&error, &config)
+                        && attempts < config.max_retries
+                    {
                         attempts += 1;
                         tracing::warn!(
                             "Request failed, retrying ({}/{}): {:?}",
