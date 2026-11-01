@@ -27,7 +27,7 @@ use super::formats::anthropic::{
 use super::openai_compatible::handle_status;
 use super::retry::ProviderRetry;
 use crate::conversation::message::Message;
-use crate::http_status::extract_request_id;
+use crate::http_status::{extract_request_id, stream_line_error};
 use crate::model::ModelConfig;
 use rmcp::model::Tool;
 
@@ -248,7 +248,7 @@ impl AnthropicProvider {
         let stream = response.bytes_stream().map_err(io::Error::other);
         Ok(Box::pin(try_stream! {
             let reader = StreamReader::new(stream);
-            let framed = tokio_util::codec::FramedRead::new(reader, tokio_util::codec::LinesCodec::new()).map_err(anyhow::Error::from);
+            let framed = tokio_util::codec::FramedRead::new(reader, tokio_util::codec::LinesCodec::new()).map_err(stream_line_error);
             let messages = response_to_streaming_message(framed);
             pin!(messages);
             while let Some(message) = futures::StreamExt::next(&mut messages).await {

@@ -2,6 +2,7 @@ use crate::api_client::{ApiClient, AuthMethod};
 use crate::base::MessageStream;
 use crate::conversation::message::Message;
 use crate::errors::ProviderError;
+use crate::http_status::stream_line_error;
 use crate::openai_compatible::handle_status;
 use crate::retry::ProviderRetry;
 
@@ -166,7 +167,7 @@ impl Provider for GoogleProvider {
         Ok(Box::pin(try_stream! {
             let stream_reader = StreamReader::new(stream);
             let framed = FramedRead::new(stream_reader, LinesCodec::new())
-                .map_err(anyhow::Error::from);
+                .map_err(stream_line_error);
 
             let message_stream = response_to_streaming_message(framed);
             pin!(message_stream);

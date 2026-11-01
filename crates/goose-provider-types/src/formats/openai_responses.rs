@@ -292,7 +292,10 @@ pub enum ResponsesStreamEvent {
         response: ResponseMetadata,
     },
     #[serde(rename = "response.failed")]
-    ResponseFailed { sequence_number: i32, error: Value },
+    ResponseFailed {
+        sequence_number: i32,
+        response: ResponseFailure,
+    },
     #[serde(rename = "response.function_call_arguments.delta")]
     FunctionCallArgumentsDelta {
         sequence_number: i32,
@@ -334,6 +337,80 @@ pub enum ResponsesStreamEvent {
     },
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResponseFailure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub error: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+fn responses_stream_error(
+    error: &Value,
+    event: &str,
+    request_id: Option<&str>,
+    response_id: Option<&str>,
+) -> ProviderError {
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("type").and_then(Value::as_str))
+        .unwrap_or("unknown_error");
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
+        .unwrap_or("The provider reported a failed response");
+    let mut details = format!("Responses API {event} ({code}): {message}");
+    if let Some(id) = response_id {
+        details.push_str(&format!(" [response_id={id}]"));
+    }
+    if let Some(id) = error
+        .get("request_id")
+        .and_then(Value::as_str)
+        .or(request_id)
+    {
+        details.push_str(&format!(" [request_id={id}]"));
+    }
+    match code {
+        "invalid_api_key"
+        | "authentication_error"
+        | "invalid_authentication"
+        | "unauthorized"
+        | "permission_denied" => ProviderError::Authentication(details),
+        "rate_limit_error" | "rate_limit_exceeded" | "too_many_requests" => {
+            ProviderError::RateLimitExceeded {
+                details,
+                retry_delay: None,
+            }
+        }
+        "context_length_exceeded" | "context_window_exceeded" => {
+            ProviderError::ContextLengthExceeded(details)
+        }
+        "insufficient_quota"
+        | "quota_exceeded"
+        | "billing_hard_limit_reached"
+        | "credits_exhausted" => ProviderError::CreditsExhausted {
+            details,
+            top_up_url: None,
+        },
+        "upstream_bad_gateway"
+        | "upstream_unavailable"
+        | "upstream_timeout"
+        | "server_error"
+        | "internal_error"
+        | "internal_server_error"
+        | "bad_gateway"
+        | "gateway_timeout"
+        | "service_unavailable"
+        | "service_unavailable_error"
+        | "server_is_overloaded"
+        | "overloaded_error" => ProviderError::ServerError(details),
+        _ => ProviderError::RequestFailed(details),
+    }
+}
+
 fn is_known_responses_stream_event_type(event_type: &str) -> bool {
     matches!(
         event_type,
@@ -359,25 +436,23 @@ fn is_known_responses_stream_event_type(event_type: &str) -> bool {
 
 fn parse_responses_stream_event(data_line: &str) -> anyhow::Result<Option<ResponsesStreamEvent>> {
     let raw_event: Value = serde_json::from_str(data_line).map_err(|e| {
-        ProviderError::stream_decode_error(format!(
-            "Failed to parse Responses stream event: {}: {:?}",
-            e, data_line
-        ))
+        ProviderError::stream_decode_error(format!("Failed to parse Responses stream event: {}", e))
     })?;
 
     let Some(event_type) = raw_event.get("type").and_then(Value::as_str) else {
         return Ok(None);
     };
 
+    if event_type == "error" && raw_event.get("error").is_none_or(Value::is_null) {
+        return Err(responses_stream_error(&raw_event, "error", None, None).into());
+    }
+
     if !is_known_responses_stream_event_type(event_type) {
         return Ok(None);
     }
 
     let event = serde_json::from_value(raw_event).map_err(|e| {
-        ProviderError::stream_decode_error(format!(
-            "Failed to parse Responses stream event: {}: {:?}",
-            e, data_line
-        ))
+        ProviderError::stream_decode_error(format!("Failed to parse Responses stream event: {}", e))
     })?;
     Ok(Some(event))
 }
@@ -1176,6 +1251,7 @@ where
         let mut output_items: Vec<ResponseOutputItemInfo> = Vec::new();
         let mut is_text_response = false;
         let mut output_token_limit_reached = false;
+        let mut completed = false;
 
         'outer: while let Some(response) = stream.next().await {
             let response_str = response?;
@@ -1251,6 +1327,7 @@ where
                 }
 
                 ResponsesStreamEvent::ResponseCompleted { response, .. } => {
+                    completed = true;
                     let model = model_name.as_ref().unwrap_or(&response.model);
                     let usage = response.usage.as_ref().map_or_else(
                         Usage::default,
@@ -1270,6 +1347,7 @@ where
                 }
 
                 ResponsesStreamEvent::ResponseIncomplete { response, .. } => {
+                    completed = true;
                     let model = model_name.as_ref().unwrap_or(&response.model);
                     let usage = response.usage.as_ref().map_or_else(
                         Usage::default,
@@ -1338,24 +1416,29 @@ where
                     // Refusal text already streamed via deltas
                 }
 
-                ResponsesStreamEvent::ResponseFailed { error, .. } => {
-                    Err::<(), ProviderError>(ProviderError::RequestFailed(format!(
-                        "Responses API failed: {:?}",
-                        error
-                    )))?;
+                ResponsesStreamEvent::ResponseFailed { response, .. } => {
+                    Err::<(), ProviderError>(responses_stream_error(
+                        &response.error,
+                        "failed",
+                        response.request_id.as_deref(),
+                        response.id.as_deref(),
+                    ))?;
                 }
 
                 ResponsesStreamEvent::Error { error } => {
-                    Err::<(), ProviderError>(ProviderError::RequestFailed(format!(
-                        "Responses API error: {:?}",
-                        error
-                    )))?;
+                    Err::<(), ProviderError>(responses_stream_error(&error, "error", None, None))?;
                 }
 
                 _ => {
                     // Ignore other event types (OutputItemAdded, ContentBlockPartAdded, ContentBlockPartDone)
                 }
             }
+        }
+
+        if !completed {
+            Err::<(), ProviderError>(ProviderError::NetworkError(
+                "Responses stream ended before a completion event".to_string(),
+            ))?;
         }
 
         // Process final output items and yield usage data
@@ -3067,6 +3150,7 @@ mod tests {
                     "delta": "cannot\u{E0042}help"
                 })
             ),
+            r#"data: {"type":"response.completed","sequence_number":6,"response":{"id":"resp_1","object":"response","status":"completed","model":"gpt-5.5","output":[]}}"#.to_string(),
             "data: [DONE]".to_string(),
         ];
         let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));

@@ -1,7 +1,6 @@
 use crate::conversation::token_usage::{CostSource, ProviderUsage};
-use crate::http_status::read_json_response;
+use crate::http_status::{read_json_response, stream_line_error};
 use crate::images::ImageFormat;
-use anyhow::Error;
 use async_stream::try_stream;
 use futures::TryStreamExt;
 use reqwest::Response;
@@ -265,7 +264,7 @@ pub fn stream_openai_compat(
     Ok(Box::pin(try_stream! {
         let stream_reader = StreamReader::new(stream);
         let framed = FramedRead::new(stream_reader, LinesCodec::new())
-            .map_err(Error::from);
+            .map_err(stream_line_error);
 
         let message_stream = response_to_streaming_message(framed);
         pin!(message_stream);
@@ -296,7 +295,7 @@ pub fn stream_responses_compat(
     Ok(Box::pin(try_stream! {
         let stream_reader = StreamReader::new(stream);
         let framed = FramedRead::new(stream_reader, LinesCodec::new())
-            .map_err(Error::from);
+            .map_err(stream_line_error);
 
         let message_stream = responses_api_to_streaming_message(framed);
         pin!(message_stream);
