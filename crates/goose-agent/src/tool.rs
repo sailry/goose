@@ -5,8 +5,9 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::StreamExt;
 use goose_provider_types::conversation::{
-    message::{Message, MessageContent, ToolRequest},
+    message::{Message, MessageContent, ProviderMetadata, ToolRequest},
     Conversation,
 };
 use rmcp::{
@@ -20,6 +21,9 @@ use crate::operation::{
     OperationResult,
 };
 use goose_provider_types::maybe_send::{MaybeSend, MaybeSync};
+
+/// The most read-only calls from one response that run at the same time.
+const MAX_CONCURRENT_READS: usize = 8;
 
 fn empty_input_schema() -> Arc<JsonObject> {
     Arc::new(
@@ -132,6 +136,16 @@ pub trait ToolProvider<S>: MaybeSend + MaybeSync {
         call: CallToolRequestParams,
         emit: &Emitter,
     ) -> Result<CallToolResult, ErrorData>;
+
+    /// Whether calls to `name` only read state, so they may run concurrently with
+    /// the adjacent read-only calls of the same response.
+    ///
+    /// Every other call runs alone: after all earlier calls finish and before any
+    /// later call starts. Tools are exclusive unless their provider reports
+    /// otherwise.
+    fn read_only(&self, _session: &S, _name: &str) -> bool {
+        false
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -186,14 +200,55 @@ where
     }
 }
 
+/// One request's response, filled in when its call completes.
+struct Slot {
+    id: String,
+    metadata: Option<ProviderMetadata>,
+    result: Option<Result<CallToolResult, ErrorData>>,
+}
+
+/// Responses to the requests of one tool step, kept in request order so a
+/// cancelled step still saves every call that completed.
+struct Responses(Vec<Slot>);
+
+impl Responses {
+    fn new(requests: &[ToolRequest]) -> Self {
+        Self(
+            requests
+                .iter()
+                .map(|request| Slot {
+                    id: request.id.clone(),
+                    metadata: request.metadata.clone(),
+                    result: None,
+                })
+                .collect(),
+        )
+    }
+
+    fn message(self) -> Option<Message> {
+        let mut message: Option<Message> = None;
+        for slot in self.0 {
+            let Some(result) = slot.result else {
+                continue;
+            };
+            message
+                .get_or_insert_with(|| Message::user().with_generated_id_if_missing())
+                .add_tool_response_with_metadata(slot.id, result, slot.metadata.as_ref());
+        }
+        message
+    }
+}
+
 /// An agent operation that advertises and dispatches tools.
 ///
 /// Tools can be registered from rmcp's typed tool traits, or supplied at runtime
-/// by a [`ToolProvider`] whose definitions may vary by session.
+/// by a [`ToolProvider`] whose definitions may vary by session. Adjacent calls
+/// that their providers report as read-only run concurrently; every other call
+/// runs alone, in request order. Responses always keep request order.
 pub struct ToolOperation<S> {
     registered: RegisteredToolProvider<S>,
     providers: Vec<Arc<dyn ToolProvider<S>>>,
-    response: Mutex<Option<Message>>,
+    response: Mutex<Option<Responses>>,
 }
 
 impl<S> ToolOperation<S>
@@ -281,6 +336,28 @@ where
         }
         Ok(available)
     }
+
+    /// Answers one pending request and records its response in request order.
+    async fn dispatch(
+        &self,
+        session: &S,
+        request: &ToolRequest,
+        provider: &dyn ToolProvider<S>,
+        index: usize,
+        emit: &Emitter,
+    ) {
+        let result = match request.tool_call.as_ref() {
+            Err(error) => Err(error.clone()),
+            Ok(call) => {
+                provider
+                    .call(session, &request.id, call.clone(), emit)
+                    .await
+            }
+        };
+        if let Some(responses) = self.response.lock().unwrap().as_mut() {
+            responses.0[index].result = Some(result);
+        }
+    }
 }
 
 impl<S> Default for ToolOperation<S>
@@ -309,7 +386,12 @@ where
         _conversation: &Conversation,
         emit: &Emitter,
     ) -> Vec<E> {
-        let response = self.response.lock().unwrap().take();
+        let response = self
+            .response
+            .lock()
+            .unwrap()
+            .take()
+            .and_then(Responses::message);
         match response {
             Some(response) => vec![E::from(emit.message(response))],
             None => Vec::new(),
@@ -359,37 +441,50 @@ where
             return not_applicable();
         }
 
-        for request in pending {
-            let provider = match request.tool_call.as_ref() {
+        let providers = pending
+            .iter()
+            .map(|request| match request.tool_call.as_ref() {
                 Ok(call) => available
                     .iter()
                     .find(|(tool, _)| tool.name == call.name)
                     .map(|(_, provider)| *provider)
                     .expect("pending requests were filtered by available tools"),
                 Err(_) => &self.registered as &dyn ToolProvider<S>,
+            })
+            .collect::<Vec<_>>();
+        // A malformed request is answered with its parse error and calls nothing.
+        let read_only = pending
+            .iter()
+            .zip(&providers)
+            .map(|(request, provider)| {
+                request
+                    .tool_call
+                    .as_ref()
+                    .map_or(true, |call| provider.read_only(session, &call.name))
+            })
+            .collect::<Vec<_>>();
+        *self.response.lock().unwrap() = Some(Responses::new(&pending));
+
+        let mut start = 0;
+        while start < pending.len() {
+            let end = if read_only[start] {
+                start + read_only[start..].iter().take_while(|read| **read).count()
+            } else {
+                start + 1
             };
-            let tool_result = match request.tool_call.as_ref() {
-                Err(error) => Err(error.clone()),
-                Ok(call) => {
-                    provider
-                        .call(session, &request.id, call.clone(), emit)
-                        .await
-                }
-            };
-            let mut output = self.response.lock().unwrap();
-            let message =
-                output.get_or_insert_with(|| Message::user().with_generated_id_if_missing());
-            message.add_tool_response_with_metadata(
-                request.id,
-                tool_result,
-                request.metadata.as_ref(),
-            );
+            futures::stream::iter(start..end)
+                .for_each_concurrent(MAX_CONCURRENT_READS, |index| {
+                    self.dispatch(session, &pending[index], providers[index], index, emit)
+                })
+                .await;
+            start = end;
         }
         let message = self
             .response
             .lock()
             .unwrap()
             .take()
+            .and_then(Responses::message)
             .expect("tool responses retained");
         let message = emit.message(message);
         applied([E::from(message)])

@@ -1,9 +1,11 @@
 use std::{
     borrow::Cow,
+    collections::HashMap,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -26,8 +28,8 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tokio::sync::mpsc;
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, Barrier};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default, Deserialize, JsonSchema)]
@@ -506,4 +508,258 @@ async fn ignores_unavailable_answered_and_externally_dispatched_requests() {
     .unwrap();
 
     assert!(matches!(result, OperationResult::NotApplicable));
+}
+
+/// Logs when each call starts and ends. A call with a `group` argument waits until
+/// every member of that group has started, so the group finishes only if its
+/// calls overlap; `yields` delays the end of a call.
+#[derive(Default)]
+struct Probe {
+    log: Mutex<Vec<String>>,
+    groups: HashMap<&'static str, Barrier>,
+    active: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl Probe {
+    fn with_group(mut self, group: &'static str, size: usize) -> Self {
+        self.groups.insert(group, Barrier::new(size));
+        self
+    }
+
+    fn log(&self) -> Vec<String> {
+        self.log.lock().unwrap().clone()
+    }
+
+    fn position(&self, entry: &str) -> usize {
+        self.log()
+            .iter()
+            .position(|logged| logged == entry)
+            .unwrap_or_else(|| panic!("{entry} was not logged"))
+    }
+}
+
+#[async_trait]
+impl ToolProvider<()> for Probe {
+    async fn tools(&self, _session: &()) -> Result<Vec<Tool>> {
+        Ok(["read", "write"]
+            .into_iter()
+            .map(|name| Tool::new(name, name, Arc::new(serde_json::Map::new())))
+            .collect())
+    }
+
+    async fn call(
+        &self,
+        _session: &(),
+        request_id: &str,
+        call: CallToolRequestParams,
+        _emit: &Emitter,
+    ) -> Result<CallToolResult, ErrorData> {
+        let arguments = call.arguments.unwrap_or_default();
+        self.log.lock().unwrap().push(format!("start {request_id}"));
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(active, Ordering::SeqCst);
+        if let Some(group) = arguments.get("group").and_then(Value::as_str) {
+            self.groups[group].wait().await;
+        }
+        for _ in 0..arguments.get("yields").and_then(Value::as_u64).unwrap_or(0) {
+            tokio::task::yield_now().await;
+        }
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        self.log.lock().unwrap().push(format!("end {request_id}"));
+        Ok(CallToolResult::structured(json!({ "id": request_id })))
+    }
+
+    fn read_only(&self, _session: &(), name: &str) -> bool {
+        name == "read"
+    }
+}
+
+/// Serves the probe's tools without reporting any of them as read-only.
+struct Unmarked(Arc<Probe>);
+
+#[async_trait]
+impl ToolProvider<()> for Unmarked {
+    async fn tools(&self, session: &()) -> Result<Vec<Tool>> {
+        self.0.tools(session).await
+    }
+
+    async fn call(
+        &self,
+        session: &(),
+        request_id: &str,
+        call: CallToolRequestParams,
+        emit: &Emitter,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.0.call(session, request_id, call, emit).await
+    }
+}
+
+/// Runs one tool step for `(id, tool, arguments)` requests and returns the
+/// response ids in message order.
+async fn respond(
+    provider: Arc<dyn ToolProvider<()>>,
+    requests: &[(&'static str, &'static str, Value)],
+) -> Vec<String> {
+    let request = requests
+        .iter()
+        .fold(Message::assistant(), |message, (id, name, arguments)| {
+            message.with_tool_request(
+                *id,
+                Ok(CallToolRequestParams::new(*name)
+                    .with_arguments(serde_json::from_value(arguments.clone()).unwrap())),
+            )
+        });
+    let conversation =
+        Conversation::new_unvalidated([Message::user().with_text("use tools"), request]);
+    let operation = ToolOperation::<()>::new().with_provider(provider);
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        <ToolOperation<()> as Operation<(), ConversationEffect>>::run(
+            &operation,
+            &(),
+            &conversation,
+            &emitter(),
+        ),
+    )
+    .await
+    .expect("the tool step should finish")
+    .unwrap();
+    appended_message(result)
+        .content
+        .iter()
+        .map(|content| content.as_tool_response().unwrap().id.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn runs_adjacent_reads_concurrently_in_request_order() {
+    let probe = Arc::new(Probe::default().with_group("reads", 3));
+    let ids = respond(
+        probe.clone(),
+        &[
+            ("first", "read", json!({"group": "reads", "yields": 3})),
+            ("second", "read", json!({"group": "reads"})),
+            ("third", "read", json!({"group": "reads"})),
+        ],
+    )
+    .await;
+
+    assert_eq!(ids, ["first", "second", "third"]);
+    assert_eq!(probe.peak.load(Ordering::SeqCst), 3);
+    assert!(probe.position("end first") > probe.position("end third"));
+}
+
+#[tokio::test]
+async fn runs_a_write_alone_between_reads() {
+    let probe = Arc::new(
+        Probe::default()
+            .with_group("before", 2)
+            .with_group("after", 2),
+    );
+    let ids = respond(
+        probe.clone(),
+        &[
+            ("read-1", "read", json!({"group": "before", "yields": 2})),
+            ("read-2", "read", json!({"group": "before"})),
+            ("write", "write", json!({"yields": 2})),
+            ("read-3", "read", json!({"group": "after"})),
+            ("read-4", "read", json!({"group": "after"})),
+        ],
+    )
+    .await;
+
+    assert_eq!(ids, ["read-1", "read-2", "write", "read-3", "read-4"]);
+    let start = probe.position("start write");
+    let end = probe.position("end write");
+    assert!(start > probe.position("end read-1"));
+    assert!(start > probe.position("end read-2"));
+    assert_eq!(end, start + 1);
+    assert!(end < probe.position("start read-3"));
+    assert!(end < probe.position("start read-4"));
+}
+
+#[tokio::test]
+async fn limits_concurrent_reads_to_eight() {
+    let probe = Arc::new(Probe::default());
+    let ids = [
+        "read-1", "read-2", "read-3", "read-4", "read-5", "read-6", "read-7", "read-8", "read-9",
+        "read-10", "read-11", "read-12",
+    ];
+    let requests = ids
+        .iter()
+        .map(|id| (*id, "read", json!({"yields": 2})))
+        .collect::<Vec<_>>();
+
+    assert_eq!(respond(probe.clone(), &requests).await, ids);
+    assert_eq!(probe.peak.load(Ordering::SeqCst), 8);
+}
+
+#[tokio::test]
+async fn runs_unmarked_tools_one_at_a_time() {
+    let probe = Arc::new(Probe::default());
+    let ids = respond(
+        Arc::new(Unmarked(probe.clone())),
+        &[
+            ("first", "read", json!({"yields": 2})),
+            ("second", "read", json!({"yields": 2})),
+        ],
+    )
+    .await;
+
+    assert_eq!(ids, ["first", "second"]);
+    assert_eq!(
+        probe.log(),
+        ["start first", "end first", "start second", "end second"]
+    );
+}
+
+#[tokio::test]
+async fn malformed_requests_join_adjacent_reads() {
+    let probe = Arc::new(Probe::default().with_group("reads", 2));
+    let read = || {
+        Ok(CallToolRequestParams::new("read")
+            .with_arguments(serde_json::from_value(json!({"group": "reads"})).unwrap()))
+    };
+    let request = Message::assistant()
+        .with_tool_request("first", read())
+        .with_tool_request(
+            "malformed",
+            Err(ErrorData::invalid_params("malformed arguments", None)),
+        )
+        .with_tool_request("second", read());
+    let conversation =
+        Conversation::new_unvalidated([Message::user().with_text("use tools"), request]);
+    let operation = ToolOperation::<()>::new().with_provider(probe);
+    let message = appended_message(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            <ToolOperation<()> as Operation<(), ConversationEffect>>::run(
+                &operation,
+                &(),
+                &conversation,
+                &emitter(),
+            ),
+        )
+        .await
+        .expect("the malformed request should not separate the reads")
+        .unwrap(),
+    );
+
+    let responses = message
+        .content
+        .iter()
+        .map(|content| content.as_tool_response().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        responses
+            .iter()
+            .map(|response| response.id.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "malformed", "second"]
+    );
+    assert_eq!(
+        responses[1].tool_result.as_ref().unwrap_err().message,
+        "malformed arguments"
+    );
 }
