@@ -28,7 +28,10 @@ is a function of the persisted conversation, not of in-memory loop state.
   session. Dynamic providers are queried before inference and again before
   execution, so their tool names and handlers must remain stable between those
   boundaries. Their schemas are sent to inference and matching calls are
-  dispatched against the current session.
+  dispatched against the current session. Adjacent calls whose provider reports
+  them as `read_only` run concurrently, at most eight at a time. Every other call
+  runs alone: it waits for all earlier calls and finishes before a later call
+  starts. Tools are exclusive by default, and responses keep request order.
 - **`StopHookOperation<S>`** — runs a `StopHook` when the model gives its final
   answer; see [Hooks](#hooks).
 - **`StateMachine<'a, S, E>`** — holds `Vec<Step<..>>` and a `CancellationToken`.
@@ -137,10 +140,10 @@ A post-tool hook sees each tool call's result right after the call. It can't
 change the result. To add one, implement `PostToolCallHook<S>` and give it to the
 step that runs the tools: `ToolOperation::new().with_post_tool_call_hook(..)`.
 Its `after_call` is called once per call that ran, right after that call and
-before the next one starts. `ToolOperation` logs an error and the run goes on, so
-the result is still saved. If you write your own step that runs tools, call
-`after_call` after each call yourself and decide what an error means; otherwise
-its calls get no post-tool hook.
+before any later call outside its concurrent batch starts. `ToolOperation` logs
+an error and the run goes on, so the result is still saved. If you write your
+own step that runs tools, call `after_call` after each call yourself and decide
+what an error means; otherwise its calls get no post-tool hook.
 
 `UnhandledToolCallsOperation` is needed with `ToolApprovalOperation`. Put it
 after every step that runs tools, right before inference. It gives calls no
@@ -173,7 +176,9 @@ the operation, not in locals of the dropped future, and drain the same field on
 normal completion. `finalize_cancellation` emits only what the client has not
 seen yet.
 `InferenceRunner` holds its streamed messages and usage; `ToolOperation` holds
-its tool response message. Use one operation instance per active execution.
+the responses of completed calls, in request order, including concurrent reads
+that finished before an earlier call. Use one operation instance per active
+execution.
 
 `Emitter` sends on an unbounded channel, so emitting never pauses and an
 operation that only builds, emits, and returns holds nothing. Dropping a future

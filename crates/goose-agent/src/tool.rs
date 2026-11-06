@@ -5,8 +5,9 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::StreamExt;
 use goose_provider_types::conversation::{
-    message::{Message, MessageContent, ToolRequest},
+    message::{Message, MessageContent, ProviderMetadata, ToolRequest, ToolResponse},
     Conversation,
 };
 use rmcp::{
@@ -22,6 +23,9 @@ use crate::operation::{
 use crate::post_tool_call_hook::PostToolCallHook;
 use crate::tool_call_state::{tool_calls, ToolCallState};
 use goose_provider_types::maybe_send::{MaybeSend, MaybeSync};
+
+/// The most read-only calls from one response that run at the same time.
+const MAX_CONCURRENT_READS: usize = 8;
 
 fn empty_input_schema() -> Arc<JsonObject> {
     Arc::new(
@@ -134,6 +138,16 @@ pub trait ToolProvider<S>: MaybeSend + MaybeSync {
         call: CallToolRequestParams,
         emit: &Emitter,
     ) -> Result<CallToolResult, ErrorData>;
+
+    /// Whether calls to `name` only read state, so they may run concurrently with
+    /// the adjacent read-only calls of the same response.
+    ///
+    /// Every other call runs alone: after all earlier calls finish and before any
+    /// later call starts. Tools are exclusive unless their provider reports
+    /// otherwise.
+    fn read_only(&self, _session: &S, _name: &str) -> bool {
+        false
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -188,15 +202,68 @@ where
     }
 }
 
+/// The response saved for `request`, as the post tool call hook sees it.
+fn tool_response(request: &ToolRequest, result: Result<CallToolResult, ErrorData>) -> ToolResponse {
+    let MessageContent::ToolResponse(tool_response) = MessageContent::tool_response_with_metadata(
+        request.id.clone(),
+        result,
+        request.metadata.as_ref(),
+    ) else {
+        unreachable!("tool_response_with_metadata builds a tool response");
+    };
+    tool_response
+}
+
+/// One request's response, filled in when its call completes.
+struct Slot {
+    id: String,
+    metadata: Option<ProviderMetadata>,
+    result: Option<Result<CallToolResult, ErrorData>>,
+}
+
+/// Responses to the requests of one tool step, kept in request order so a
+/// cancelled step still saves every call that completed.
+struct Responses(Vec<Slot>);
+
+impl Responses {
+    fn new(requests: &[ToolRequest]) -> Self {
+        Self(
+            requests
+                .iter()
+                .map(|request| Slot {
+                    id: request.id.clone(),
+                    metadata: request.metadata.clone(),
+                    result: None,
+                })
+                .collect(),
+        )
+    }
+
+    fn message(self) -> Option<Message> {
+        let mut message: Option<Message> = None;
+        for slot in self.0 {
+            let Some(result) = slot.result else {
+                continue;
+            };
+            message
+                .get_or_insert_with(|| Message::user().with_generated_id_if_missing())
+                .add_tool_response_with_metadata(slot.id, result, slot.metadata.as_ref());
+        }
+        message
+    }
+}
+
 /// An agent operation that advertises and dispatches tools.
 ///
 /// Tools can be registered from rmcp's typed tool traits, or supplied at runtime
-/// by a [`ToolProvider`] whose definitions may vary by session.
+/// by a [`ToolProvider`] whose definitions may vary by session. Adjacent calls
+/// that their providers report as read-only run concurrently; every other call
+/// runs alone, in request order. Responses always keep request order.
 pub struct ToolOperation<S> {
     registered: RegisteredToolProvider<S>,
     providers: Vec<Arc<dyn ToolProvider<S>>>,
     post_tool_call_hook: Option<Arc<dyn PostToolCallHook<S>>>,
-    tool_responses: Mutex<Option<Message>>,
+    tool_responses: Mutex<Option<Responses>>,
 }
 
 impl<S> ToolOperation<S>
@@ -290,6 +357,42 @@ where
         }
         Ok(available)
     }
+
+    /// Answers one pending request, records its response in request order, then
+    /// shows a call that ran to the post tool call hook.
+    async fn dispatch(
+        &self,
+        session: &S,
+        conversation: &Conversation,
+        request: &ToolRequest,
+        provider: &dyn ToolProvider<S>,
+        index: usize,
+        emit: &Emitter,
+    ) {
+        let result = match request.tool_call.as_ref() {
+            Err(error) => Err(error.clone()),
+            Ok(call) => {
+                provider
+                    .call(session, &request.id, call.clone(), emit)
+                    .await
+            }
+        };
+        let hooked = match (&request.tool_call, &self.post_tool_call_hook) {
+            (Ok(_), Some(hook)) => Some((hook, tool_response(request, result.clone()))),
+            _ => None,
+        };
+        if let Some(responses) = self.tool_responses.lock().unwrap().as_mut() {
+            responses.0[index].result = Some(result);
+        }
+        if let Some((hook, tool_response)) = hooked {
+            if let Err(error) = hook
+                .after_call(session, conversation, request, &tool_response)
+                .await
+            {
+                tracing::warn!(%error, tool_call_id = %request.id, "post tool call hook failed");
+            }
+        }
+    }
 }
 
 impl<S> Default for ToolOperation<S>
@@ -318,7 +421,12 @@ where
         _conversation: &Conversation,
         emit: &Emitter,
     ) -> Vec<E> {
-        let tool_responses = self.tool_responses.lock().unwrap().take();
+        let tool_responses = self
+            .tool_responses
+            .lock()
+            .unwrap()
+            .take()
+            .and_then(Responses::message);
         match tool_responses {
             Some(tool_responses) => vec![E::from(emit.message(tool_responses))],
             None => Vec::new(),
@@ -364,53 +472,57 @@ where
             return not_applicable();
         }
 
-        for request in pending {
-            let provider = match request.tool_call.as_ref() {
+        let providers = pending
+            .iter()
+            .map(|request| match request.tool_call.as_ref() {
                 Ok(call) => available
                     .iter()
                     .find(|(tool, _)| tool.name == call.name)
                     .map(|(_, provider)| *provider)
                     .expect("pending requests were filtered by available tools"),
                 Err(_) => &self.registered as &dyn ToolProvider<S>,
+            })
+            .collect::<Vec<_>>();
+        // A malformed request is answered with its parse error and calls nothing.
+        let read_only = pending
+            .iter()
+            .zip(&providers)
+            .map(|(request, provider)| {
+                request
+                    .tool_call
+                    .as_ref()
+                    .map_or(true, |call| provider.read_only(session, &call.name))
+            })
+            .collect::<Vec<_>>();
+        *self.tool_responses.lock().unwrap() = Some(Responses::new(&pending));
+
+        let mut start = 0;
+        while start < pending.len() {
+            let end = if read_only[start] {
+                start + read_only[start..].iter().take_while(|read| **read).count()
+            } else {
+                start + 1
             };
-            let tool_result = match request.tool_call.as_ref() {
-                Err(error) => Err(error.clone()),
-                Ok(call) => {
-                    provider
-                        .call(session, &request.id, call.clone(), emit)
-                        .await
-                }
-            };
-            let tool_response = {
-                let mut tool_responses = self.tool_responses.lock().unwrap();
-                let tool_responses = tool_responses
-                    .get_or_insert_with(|| Message::user().with_generated_id_if_missing());
-                tool_responses.add_tool_response_with_metadata(
-                    request.id.clone(),
-                    tool_result,
-                    request.metadata.as_ref(),
-                );
-                tool_responses
-                    .content
-                    .last()
-                    .and_then(MessageContent::as_tool_response)
-                    .cloned()
-                    .expect("tool response just added")
-            };
-            if let (Ok(_), Some(hook)) = (&request.tool_call, &self.post_tool_call_hook) {
-                if let Err(error) = hook
-                    .after_call(session, conversation, &request, &tool_response)
-                    .await
-                {
-                    tracing::warn!(%error, tool_call_id = %request.id, "post tool call hook failed");
-                }
-            }
+            futures::stream::iter(start..end)
+                .for_each_concurrent(MAX_CONCURRENT_READS, |index| {
+                    self.dispatch(
+                        session,
+                        conversation,
+                        &pending[index],
+                        providers[index],
+                        index,
+                        emit,
+                    )
+                })
+                .await;
+            start = end;
         }
         let tool_responses = self
             .tool_responses
             .lock()
             .unwrap()
             .take()
+            .and_then(Responses::message)
             .expect("tool responses retained");
         applied([E::from(emit.message(tool_responses))])
     }

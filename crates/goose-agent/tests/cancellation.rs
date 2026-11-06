@@ -430,3 +430,87 @@ async fn stop_during_a_post_tool_call_hook_saves_the_result_without_rerunning_th
     assert_eq!(remaining.id, "remaining");
     assert!(interrupted(&messages[3].content[0]));
 }
+
+/// Read-only tools that either never finish or finish at once, and a write.
+#[derive(Default)]
+struct Reads {
+    finished: AtomicUsize,
+    wrote: AtomicBool,
+}
+
+#[async_trait]
+impl ToolProvider<Session> for Reads {
+    async fn tools(&self, _session: &Session) -> Result<Vec<Tool>> {
+        Ok(["slow_read", "fast_read", "write"]
+            .into_iter()
+            .map(|name| Tool::new(name, name, Arc::new(serde_json::Map::new())))
+            .collect())
+    }
+
+    async fn call(
+        &self,
+        _session: &Session,
+        _request_id: &str,
+        call: CallToolRequestParams,
+        _emit: &Emitter,
+    ) -> Result<CallToolResult, ErrorData> {
+        match &*call.name {
+            "slow_read" => std::future::pending::<()>().await,
+            "fast_read" => {
+                self.finished.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => self.wrote.store(true, Ordering::SeqCst),
+        }
+        Ok(CallToolResult::success(vec![ContentBlock::text("done")]))
+    }
+
+    fn read_only(&self, _session: &Session, name: &str) -> bool {
+        name != "write"
+    }
+}
+
+#[tokio::test]
+async fn stop_saves_finished_reads_and_skips_later_calls() {
+    let reads = Arc::new(Reads::default());
+    let operation = ToolOperation::<Session>::new().with_provider(reads.clone());
+    let cancel = CancellationToken::new();
+    let machine = StateMachine::new(vec![Step::Operation(Arc::new(operation))], cancel.clone());
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let emit = Emitter::new(tx, cancel.clone());
+    let runtime = Runtime::new([
+        Message::user().with_text("kickoff"),
+        executable_calls(&[
+            ("slow", "slow_read"),
+            ("fast-1", "fast_read"),
+            ("fast-2", "fast_read"),
+            ("write", "write"),
+        ]),
+    ]);
+    let run = tokio::spawn(async move { machine.run(&runtime, "session", &emit).await });
+    while reads.finished.load(Ordering::SeqCst) < 2 {
+        tokio::task::yield_now().await;
+    }
+    cancel.cancel();
+    let messages = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("Stop should not wait for the unfinished read")
+        .unwrap()
+        .unwrap()
+        .0
+        .messages()
+        .clone();
+
+    let ids = |message: &Message| {
+        message
+            .content
+            .iter()
+            .map(|content| content.as_tool_response().unwrap().id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(messages.len(), 4);
+    assert_eq!(ids(&messages[2]), ["fast-1", "fast-2"]);
+    assert!(!messages[2].content.iter().any(interrupted));
+    assert_eq!(ids(&messages[3]), ["slow", "write"]);
+    assert!(messages[3].content.iter().all(interrupted));
+    assert!(!reads.wrote.load(Ordering::SeqCst));
+}
