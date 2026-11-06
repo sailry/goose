@@ -139,13 +139,14 @@ pub trait ToolProvider<S>: MaybeSend + MaybeSync {
         emit: &Emitter,
     ) -> Result<CallToolResult, ErrorData>;
 
-    /// Whether calls to `name` only read state, so they may run concurrently with
-    /// the adjacent read-only calls of the same response.
+    /// Whether `call` may run alongside the other concurrent calls in the same
+    /// batch: the adjacent calls of one response for which this also holds.
     ///
-    /// Every other call runs alone: after all earlier calls finish and before any
-    /// later call starts. Tools are exclusive unless their provider reports
-    /// otherwise.
-    fn read_only(&self, _session: &S, _name: &str) -> bool {
+    /// Report this only for calls that neither change nor depend on state that
+    /// other calls of the response observe. Every other call runs alone: after all
+    /// earlier calls finish and before any later call starts. Calls are exclusive
+    /// unless their provider reports otherwise.
+    fn concurrent(&self, _session: &S, _call: &CallToolRequestParams) -> bool {
         false
     }
 }
@@ -237,6 +238,28 @@ impl Responses {
                 })
                 .collect(),
         )
+    }
+
+    /// Answers each unfinished call once as interrupted, so a cancelled step
+    /// saves a single message in request order.
+    fn interrupt(mut self) -> Self {
+        let mut answered = self
+            .0
+            .iter()
+            .filter(|slot| slot.result.is_some())
+            .map(|slot| slot.id.clone())
+            .collect::<HashSet<_>>();
+        self.0.retain_mut(|slot| {
+            if slot.result.is_some() {
+                return true;
+            }
+            if !answered.insert(slot.id.clone()) {
+                return false;
+            }
+            slot.result = Some(crate::machine::interrupted());
+            true
+        });
+        self
     }
 
     fn message(self) -> Option<Message> {
@@ -426,7 +449,7 @@ where
             .lock()
             .unwrap()
             .take()
-            .and_then(Responses::message);
+            .and_then(|responses| responses.interrupt().message());
         match tool_responses {
             Some(tool_responses) => vec![E::from(emit.message(tool_responses))],
             None => Vec::new(),
@@ -484,22 +507,26 @@ where
             })
             .collect::<Vec<_>>();
         // A malformed request is answered with its parse error and calls nothing.
-        let read_only = pending
+        let concurrent = pending
             .iter()
             .zip(&providers)
             .map(|(request, provider)| {
                 request
                     .tool_call
                     .as_ref()
-                    .map_or(true, |call| provider.read_only(session, &call.name))
+                    .map_or(true, |call| provider.concurrent(session, call))
             })
             .collect::<Vec<_>>();
         *self.tool_responses.lock().unwrap() = Some(Responses::new(&pending));
 
         let mut start = 0;
         while start < pending.len() {
-            let end = if read_only[start] {
-                start + read_only[start..].iter().take_while(|read| **read).count()
+            let end = if concurrent[start] {
+                start
+                    + concurrent[start..]
+                        .iter()
+                        .take_while(|batch| **batch)
+                        .count()
             } else {
                 start + 1
             };

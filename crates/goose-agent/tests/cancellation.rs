@@ -315,7 +315,7 @@ fn executable_calls(calls: &[(&str, &str)]) -> Message {
 }
 
 #[tokio::test]
-async fn stop_saves_completed_results_then_responds_to_each_open_request_once() {
+async fn stop_responds_to_each_open_request_once_in_order() {
     let operation = ToolOperation::new()
         .with_provider(Arc::new(FinishingTools))
         .with_sync_tool::<BlockingSyncTool>();
@@ -347,9 +347,14 @@ async fn stop_saves_completed_results_then_responds_to_each_open_request_once() 
         .messages()
         .clone();
 
-    assert_eq!(messages.len(), 4);
+    assert_eq!(messages.len(), 3);
+    let ids: Vec<_> = messages[2]
+        .content
+        .iter()
+        .map(|content| content.as_tool_response().unwrap().id.as_str())
+        .collect();
+    assert_eq!(ids, ["completed", "blocking", "remaining"]);
     let output = messages[2].content[0].as_tool_response().unwrap();
-    assert_eq!(output.id, "completed");
     assert_eq!(
         output.tool_result.as_ref().unwrap().content[0]
             .as_text()
@@ -357,13 +362,7 @@ async fn stop_saves_completed_results_then_responds_to_each_open_request_once() 
             .text,
         "finished output"
     );
-    let interrupted_ids: Vec<_> = messages[3]
-        .content
-        .iter()
-        .map(|content| content.as_tool_response().unwrap().id.as_str())
-        .collect();
-    assert_eq!(interrupted_ids, ["blocking", "remaining"]);
-    assert!(messages[3].content.iter().all(interrupted));
+    assert!(messages[2].content[1..].iter().all(interrupted));
 }
 
 struct StoppingHook {
@@ -416,7 +415,7 @@ async fn stop_during_a_post_tool_call_hook_saves_the_result_without_rerunning_th
     .clone();
 
     assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(messages.len(), 4);
+    assert_eq!(messages.len(), 3);
     let output = messages[2].content[0].as_tool_response().unwrap();
     assert_eq!(output.id, "hooked");
     assert_eq!(
@@ -426,9 +425,9 @@ async fn stop_during_a_post_tool_call_hook_saves_the_result_without_rerunning_th
             .text,
         "finished output"
     );
-    let remaining = messages[3].content[0].as_tool_response().unwrap();
+    let remaining = messages[2].content[1].as_tool_response().unwrap();
     assert_eq!(remaining.id, "remaining");
-    assert!(interrupted(&messages[3].content[0]));
+    assert!(interrupted(&messages[2].content[1]));
 }
 
 /// Read-only tools that either never finish or finish at once, and a write.
@@ -464,13 +463,13 @@ impl ToolProvider<Session> for Reads {
         Ok(CallToolResult::success(vec![ContentBlock::text("done")]))
     }
 
-    fn read_only(&self, _session: &Session, name: &str) -> bool {
-        name != "write"
+    fn concurrent(&self, _session: &Session, call: &CallToolRequestParams) -> bool {
+        call.name != "write"
     }
 }
 
 #[tokio::test]
-async fn stop_saves_finished_reads_and_skips_later_calls() {
+async fn stop_saves_results_in_request_order_and_skips_later_calls() {
     let reads = Arc::new(Reads::default());
     let operation = ToolOperation::<Session>::new().with_provider(reads.clone());
     let cancel = CancellationToken::new();
@@ -507,10 +506,11 @@ async fn stop_saves_finished_reads_and_skips_later_calls() {
             .map(|content| content.as_tool_response().unwrap().id.clone())
             .collect::<Vec<_>>()
     };
-    assert_eq!(messages.len(), 4);
-    assert_eq!(ids(&messages[2]), ["fast-1", "fast-2"]);
-    assert!(!messages[2].content.iter().any(interrupted));
-    assert_eq!(ids(&messages[3]), ["slow", "write"]);
-    assert!(messages[3].content.iter().all(interrupted));
+    assert_eq!(messages.len(), 3);
+    let results = &messages[2].content;
+    assert_eq!(ids(&messages[2]), ["slow", "fast-1", "fast-2", "write"]);
+    assert!(interrupted(&results[0]));
+    assert!(!interrupted(&results[1]) && !interrupted(&results[2]));
+    assert!(interrupted(&results[3]));
     assert!(!reads.wrote.load(Ordering::SeqCst));
 }
