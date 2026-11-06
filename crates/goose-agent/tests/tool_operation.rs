@@ -19,7 +19,7 @@ use goose_agent::{
     tool::{ToolOperation, ToolProvider},
 };
 use goose_provider_types::conversation::{
-    message::{Message, MessageContent},
+    message::{Message, MessageContent, ProviderMetadata},
     Conversation,
 };
 use rmcp::{
@@ -567,15 +567,21 @@ impl ToolProvider<()> for Probe {
         }
         self.active.fetch_sub(1, Ordering::SeqCst);
         self.log.lock().unwrap().push(format!("end {request_id}"));
+        if arguments.get("fail").and_then(Value::as_bool) == Some(true) {
+            return Err(ErrorData::internal_error(
+                format!("{request_id} failed"),
+                None,
+            ));
+        }
         Ok(CallToolResult::structured(json!({ "id": request_id })))
     }
 
-    fn read_only(&self, _session: &(), name: &str) -> bool {
-        name == "read"
+    fn concurrent(&self, _session: &(), call: &CallToolRequestParams) -> bool {
+        call.name == "read"
     }
 }
 
-/// Serves the probe's tools without reporting any of them as read-only.
+/// Serves the probe's tools without reporting any of them as concurrent.
 struct Unmarked(Arc<Probe>);
 
 #[async_trait]
@@ -762,4 +768,91 @@ async fn malformed_requests_join_adjacent_reads() {
         responses[1].tool_result.as_ref().unwrap_err().message,
         "malformed arguments"
     );
+}
+
+/// Runs one tool step over `request` and returns its appended response message.
+async fn run_probe(probe: Arc<Probe>, request: Message) -> Message {
+    let conversation =
+        Conversation::new_unvalidated([Message::user().with_text("use tools"), request]);
+    let operation = ToolOperation::<()>::new().with_provider(probe);
+    appended_message(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            <ToolOperation<()> as Operation<(), ConversationEffect>>::run(
+                &operation,
+                &(),
+                &conversation,
+                &emitter(),
+            ),
+        )
+        .await
+        .expect("the tool step should finish")
+        .unwrap(),
+    )
+}
+
+fn read(arguments: Value) -> Result<CallToolRequestParams, ErrorData> {
+    Ok(CallToolRequestParams::new("read")
+        .with_arguments(serde_json::from_value(arguments).unwrap()))
+}
+
+#[tokio::test]
+async fn keeps_failed_calls_in_a_concurrent_group() {
+    let probe = Arc::new(Probe::default().with_group("reads", 3));
+    let request = Message::assistant()
+        .with_tool_request("first", read(json!({"group": "reads", "yields": 2})))
+        .with_tool_request("failed", read(json!({"group": "reads", "fail": true})))
+        .with_tool_request("third", read(json!({"group": "reads"})));
+    let message = run_probe(probe.clone(), request).await;
+
+    let responses = message
+        .content
+        .iter()
+        .map(|content| content.as_tool_response().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        responses
+            .iter()
+            .map(|response| response.id.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "failed", "third"]
+    );
+    assert!(responses[0].tool_result.is_ok());
+    assert_eq!(
+        responses[1].tool_result.as_ref().unwrap_err().message,
+        "failed failed"
+    );
+    assert!(responses[2].tool_result.is_ok());
+    assert_eq!(probe.peak.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn keeps_provider_metadata_on_concurrent_responses() {
+    let probe = Arc::new(Probe::default().with_group("reads", 2));
+    let metadata =
+        |id: &str| serde_json::from_value::<ProviderMetadata>(json!({ "signature": id })).unwrap();
+    let request = Message::assistant()
+        .with_tool_request_with_metadata(
+            "first",
+            read(json!({"group": "reads", "yields": 2})),
+            Some(&metadata("first")),
+            None,
+        )
+        .with_tool_request("plain", read(json!({})))
+        .with_tool_request_with_metadata(
+            "second",
+            read(json!({"group": "reads"})),
+            Some(&metadata("second")),
+            None,
+        );
+    let message = run_probe(probe, request).await;
+
+    let responses = message
+        .content
+        .iter()
+        .map(|content| content.as_tool_response().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(responses[0].metadata, Some(metadata("first")));
+    assert_eq!(responses[1].metadata, None);
+    assert_eq!(responses[2].metadata, Some(metadata("second")));
 }

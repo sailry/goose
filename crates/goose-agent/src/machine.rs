@@ -70,6 +70,13 @@ fn empty_result<E>(status: RunStatus) -> StepResult<E> {
     }
 }
 
+/// The result recorded for a call that Stop interrupted before it completed.
+pub(crate) fn interrupted() -> Result<rmcp::model::CallToolResult, rmcp::model::ErrorData> {
+    Ok(rmcp::model::CallToolResult::error(vec![
+        rmcp::model::ContentBlock::text("Tool call was interrupted before completing"),
+    ]))
+}
+
 fn interrupted_response(messages: &[Message]) -> Option<Message> {
     let answered = messages
         .iter()
@@ -85,9 +92,7 @@ fn interrupted_response(messages: &[Message]) -> Option<Message> {
         if request_ids.insert(request.id.as_str()) && !answered.contains(request.id.as_str()) {
             response.add_tool_response_with_metadata(
                 request.id.clone(),
-                Ok(rmcp::model::CallToolResult::error(vec![
-                    rmcp::model::ContentBlock::text("Tool call was interrupted before completing"),
-                ])),
+                interrupted(),
                 request.metadata.as_ref(),
             );
         }

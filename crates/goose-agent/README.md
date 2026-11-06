@@ -29,9 +29,9 @@ is a function of the persisted conversation, not of in-memory loop state.
   execution, so their tool names and handlers must remain stable between those
   boundaries. Their schemas are sent to inference and matching calls are
   dispatched against the current session. Adjacent calls whose provider reports
-  them as `read_only` run concurrently, at most eight at a time. Every other call
+  them as `concurrent` run together, at most eight at a time. Every other call
   runs alone: it waits for all earlier calls and finishes before a later call
-  starts. Tools are exclusive by default, and responses keep request order.
+  starts. Calls are exclusive by default, and responses keep request order.
 - **`StateMachine<'a, S, E>`** — holds `Vec<Step<..>>` and a `CancellationToken`.
   `step()` runs one pass and returns a `StepResult` whose `applied_step` names
   the step that applied (`None` if none did) and whose `status` says whether the
@@ -72,9 +72,10 @@ the operation, not in locals of the dropped future, and drain the same field on
 normal completion. `finalize_cancellation` emits only what the client has not
 seen yet.
 `InferenceRunner` holds its streamed messages and usage; `ToolOperation` holds
-the responses of completed calls, in request order, including concurrent reads
-that finished before an earlier call. Use one operation instance per active
-execution.
+the responses of completed calls, including concurrent calls that finished
+before an earlier one, and on Stop saves them with its unfinished calls answered
+as interrupted in one message, in request order. Use one operation instance per
+active execution.
 
 `Emitter` sends on an unbounded channel, so emitting never pauses and an
 operation that only builds, emits, and returns holds nothing. Dropping a future
